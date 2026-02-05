@@ -28,8 +28,8 @@ graph TD
     end
     
     subgraph "External Providers"
-        OB[OneBalance API v3]
-        YO[Yo Protocol (Gateway)]
+        OB["OneBalance API v3"]
+        YO["Yo Protocol (Gateway)"]
     end
 
     %% Flows
