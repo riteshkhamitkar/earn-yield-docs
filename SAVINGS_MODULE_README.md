@@ -77,28 +77,35 @@ sequenceDiagram
 
     Note over FE: User selects "Trip to Mexico" (goalId: 123)<br/>and enters $100 USDC.
 
+    %% STEP 1: PREPARE
     FE->>API: POST /yield/deposit/quote<br/>{ vault: "yoUSD", amount: 100, goalId: "123" }
-    
     activate API
-    API->>YO: Get on-chain conversion rate (Assets -> Shares)
+    API->>YO: Get on-chain conversion rate
     API->>OB: POST /v3/quote/prepare-call-quote
-    OB-->>API: Returns ChainOperations & Signature
-    
+    OB-->>API: Returns ChainOperations (Signable)
     Note right of API: CACHE: quoteId_ABC -> { ..., goalId: "123" }
-    
-    API-->>FE: Return quoteId_ABC + Signable Data
+    API-->>FE: Return quoteId_ABC + ChainOperations
     deactivate API
 
-    Note over FE: User signs with Passkey (Turnkey)
-
-    FE->>API: POST /yield/deposit/execute<br/>{ quoteId_ABC, signature, ... }
+    %% STEP 2: CONSENT SIGNATURE
+    Note over FE: User Signs (Sig 1)<br/>"I consent to this operation"
     
+    FE->>API: POST /yield/deposit/call-quote<br/>{ quoteId_ABC, signature: Sig1 }
+    activate API
+    API->>OB: POST /v3/quote/call-quote
+    OB-->>API: Returns originChainsOperations (Actual Tx)
+    API-->>FE: Return originChainsOperations
+    deactivate API
+
+    %% STEP 3: EXECUTION SIGNATURE
+    Note over FE: User Signs (Sig 2)<br/>"I authorize this transaction"
+
+    FE->>API: POST /yield/deposit/execute<br/>{ quoteId_ABC, signature: Sig2 }
     activate API
     API->>API: Retrieve quoteId_ABC from Cache<br/>(Found goalId: "123")
     
-    API->>OB: POST /v3/quote/call-quote (Validate)
-    API->>OB: POST /v3/quote/execute-quote (Broadcast)
-    OB-->>API: Success loop
+    API->>OB: POST /v3/quote/execute-quote
+    OB-->>API: Success Response
     OB->>YO: [On-Chain] Deposit Assets -> Mint yoUSD
     
     API->>DB: INSERT into Transaction<br/>{ ..., savingsGoalId: "123" }
