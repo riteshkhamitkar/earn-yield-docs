@@ -18,6 +18,7 @@ This document describes the **off-chain** features for moving funds between Savi
 7. [Frontend Integration Checklist](#7-frontend-integration-checklist)
 8. [Error Handling](#8-error-handling)
 9. [TypeScript Interfaces](#9-typescript-interfaces)
+10. [Bug Fix: General Savings → Goal Balance Logic](#10-bug-fix-general-savings--goal-balance-logic)
 
 ---
 
@@ -367,6 +368,113 @@ function getTransferDescription(entry: ActivityPreviewEntry): string {
   return `Transfer ${direction} ${entry.relatedGoalName ?? 'General Savings'}`;
 }
 ```
+
+---
+
+## 10. Bug Fix: General Savings → Goal Balance Logic
+
+### Background
+
+When a user transfers **from General Savings to a Goal**, the backend creates two child transactions:
+- **OUT** (`INTERNAL_TRANSFER_OUT`): `savingsGoalId = null` (money left General Savings)
+- **IN** (`INTERNAL_TRANSFER_IN`): `savingsGoalId = goalId` (money arrived at the goal)
+
+### The Bug (Old Implementation)
+
+The old logic tried to handle the OUT record (when `savingsGoalId` is null) by modifying `vaultTotals.netDeposited`:
+
+```typescript
+// BUGGY — Do not use
+if (tx.type === 'INTERNAL_TRANSFER_OUT' && !tx.savingsGoalId) {
+  const goal = activeGoals.find(g => g.id === (tx.metadata as any)?.toGoalId);
+  if (goal) {
+    const vTotal = vaultTotals.get(goal.yieldTokenSymbol) || { netDeposited: 0 };
+    vTotal.netDeposited -= parseFloat(tx.fromAmount!);  // ❌ Corrupts on-chain total
+    vaultTotals.set(goal.yieldTokenSymbol, vTotal);
+  }
+}
+```
+
+**Why it's wrong:** `vaultTotals.netDeposited` is the raw sum of on-chain deposits and withdrawals. Mixing off-chain internal transfer amounts into it corrupts the calculation and can produce incorrect General Savings or goal balances.
+
+---
+
+### The Fix (Current Implementation)
+
+The fix: **remove that block entirely.** We only process internal transactions that have a `savingsGoalId` (i.e., they affect a specific goal's balance).
+
+- **General Savings → Goal:** Only the **IN** record is processed. It increases the destination goal's balance. General Savings is computed as `Total On-Chain Value - Sum(All Goal Balances)`, so it **automatically decreases** when the goal’s balance increases.
+- No modification to `vaultTotals` for internal transfers. On-chain data stays pure.
+
+```typescript
+// CORRECT — Current implementation
+for (const tx of sortedInternalTxs) {
+  if (tx.savingsGoalId) {
+    const goalId = tx.savingsGoalId;
+    const amount = parseFloat(
+      tx.type === TransactionType.INTERNAL_TRANSFER_IN ? tx.toAmount! : tx.fromAmount!,
+    );
+    const prev = goalRunningBalances.get(goalId) ?? 0;
+
+    if (tx.type === TransactionType.INTERNAL_TRANSFER_IN) {
+      goalRunningBalances.set(goalId, prev + amount);
+    } else {
+      goalRunningBalances.set(goalId, Math.max(0, prev - amount));
+    }
+  }
+}
+```
+
+---
+
+### Real Scenario: Before vs After
+
+**Setup:**
+- Total on-chain yoUSD vault value: **$1000**
+- Goal "Vacation" balance: **$200**
+- General Savings: **$800** ($1000 − $200)
+
+**Action:** User transfers **$50** from General Savings to Goal "Vacation".
+
+| | Old (Buggy) | New (Correct) |
+|--|-------------|---------------|
+| **OUT record** (savingsGoalId=null) | Subtracted 50 from `vaultTotals.netDeposited` → corrupted on-chain total | Skipped (no savingsGoalId) |
+| **IN record** (savingsGoalId=Vacation) | Added 50 to Vacation's balance | Added 50 to Vacation's balance |
+| **Vacation balance** | $250 ✓ | $250 ✓ |
+| **General Savings** | Wrong (used corrupted vault total) | $750 ✓ ($1000 − $250) |
+
+**Correct outcome:** Vacation = $250, General Savings = $750.
+
+---
+
+### Real Scenario: Multiple Transfers (Cascading Effect)
+
+**Setup:**
+- Total on-chain value: **$500**
+- Goal A: **$100**
+- Goal B: **$50**
+- General Savings: **$350**
+
+**Actions:**
+1. Transfer $30 from General Savings → Goal A
+2. Transfer $20 from Goal A → Goal B
+
+| Step | Old (Buggy) | New (Correct) |
+|-----|-------------|---------------|
+| Step 1 — General → Goal A | Corrupts vaultTotals; Goal A = $130, General = wrong | Goal A = $130, General = $320 (500 − 130 − 50) |
+| Step 2 — Goal A → Goal B | Goal A = $110, Goal B = $70; General still wrong | Goal A = $110, Goal B = $70, General = $320 ✓ |
+
+**Correct outcome:** Goal A = $110, Goal B = $70, General Savings = $320. Total = $501... Actually 110+70+320 = 500. ✓
+
+---
+
+### Summary of the Fix
+
+| Aspect | Old | New |
+|--------|-----|-----|
+| Records processed | OUT (null) + IN (goalId) | Only records with `savingsGoalId` |
+| `vaultTotals` touched by internal? | Yes (bug) | No |
+| General Savings formula | Broken | `Total On-Chain − Sum(Goal Balances)` — works correctly |
 
 ---
 
