@@ -75,8 +75,8 @@ model BlendAccount {
 
 ## 5. Sequence Workflows
 
-### 5.1 Account Provisioning
-When a user accesses the Savings tab for the first time, we map them to a Blend account.
+### 5.1 Account Provisioning (Initialization)
+Account provisioning should be an explicit action to adhere to REST principles (avoiding side-effects on GET requests). When a user accesses the Savings tab, the app checks its local state. If no Blend account exists, it calls the initialization endpoint.
 
 ```mermaid
 sequenceDiagram
@@ -85,7 +85,7 @@ sequenceDiagram
     participant DB as Postgres
     participant Blend as Blend API
 
-    Mobile->>BE: GET /savings/home
+    Mobile->>BE: POST /api/v1/blend/account/initialize
     BE->>DB: Check for BlendAccount
     alt No BlendAccount exists
         BE->>Blend: sdk.lookupAccount(userWalletAddress)
@@ -95,11 +95,11 @@ sequenceDiagram
         Blend-->>BE: accountId, safeAddress, chainsDeployed
         BE->>DB: Create BlendAccount record
     end
-    BE-->>Mobile: Return Savings Dashboard Data
+    BE-->>Mobile: { success: true, blendAccountId }
 ```
 
-### 5.2 Deposit Flow (Quote, Sign, Submit)
-This is the core orchestration flow where the backend prepares the transaction, but the mobile app signs it.
+### 5.2 Deposit Flow (Prepare, Sign, Execute)
+This is the core orchestration flow where the backend prepares the transaction, locks the session, and the mobile app signs it.
 
 ```mermaid
 sequenceDiagram
@@ -108,23 +108,23 @@ sequenceDiagram
     participant Worker as Background Worker
     participant Blend as Blend API
 
-    %% Phase 1: Quote & Prepare
-    Mobile->>BE: POST /savings/deposit/quote { amount, token }
+    %% Phase 1: Prepare (Quote & Lock)
+    Mobile->>BE: POST /savings/deposit/prepare { amount, token }
     BE->>Blend: client.sessions.createSession()
     Blend-->>BE: session
     BE->>Blend: client.sessions.quoteDeposit(session.intentId, params)
     Blend-->>BE: quote payload
-    BE->>BE: depositQuoteToActionPlan(quote.payload, userEoa)
+    BE->>Blend: client.sessions.lock(intentId, { signerAddress: userEoa })
+    Blend-->>BE: { intentId, payload }
+    BE->>BE: depositQuoteToActionPlan(payload, userEoa)
     BE-->>Mobile: { intentId, actionPlan }
 
     %% Phase 2: Client-side Signing
     Note over Mobile: User confirms with FaceID/TouchID
-    Mobile->>Mobile: Turnkey SDK signs actionPlan
-    Mobile->>Mobile: Broadcasts Tx to Blockchain
+    Mobile->>Mobile: Turnkey SDK signs & broadcasts actionPlan Txs
     
     %% Phase 3: Submit & Poll
     Mobile->>BE: POST /savings/deposit/execute { intentId, txHashes }
-    BE->>Blend: client.sessions.lock(intentId, { signerAddress })
     BE->>Blend: client.sessions.submit(intentId, { txHashes })
     BE->>Worker: Add Polling Job { intentId }
     BE-->>Mobile: { status: "PROCESSING" } (Instant Response)
@@ -141,13 +141,28 @@ sequenceDiagram
 ```
 
 ### 5.3 Withdraw Flow
-The withdrawal flow uses a similar orchestration model, but utilizes `withdrawCalldataToActionPlans` to generate the payload, and relies on Pimlico for gas-sponsored ERC-4337 abstraction.
+The withdrawal flow uses a similar orchestration model, but utilizes `withdrawCalldataToActionPlans` to generate the payload, and relies on Pimlico for gas-sponsored ERC-4337 abstraction (as the withdrawal originates from the user's Blend Gnosis Safe, not their standard EOA).
 
-1. **Quote:** `client.sessions.quoteWithdraw()`
-2. **Parse:** `withdrawCalldataToActionPlans(session.payload)` -> generates `ActionPlan[]` (one per source chain).
-3. **Sign:** Mobile app signs the withdrawal action plans.
-4. **Submit:** Backend calls `lock()` and `submit(intentId, { txHashes })`.
+1. **Prepare:** Mobile calls `POST /api/v1/blend/withdraw/prepare`. Backend calls `client.sessions.quoteWithdraw()`, then `client.sessions.lock()`.
+2. **Parse:** Backend runs `withdrawCalldataToActionPlans(session.payload)` -> generates `ActionPlan[]` (one per source chain) and returns to Mobile.
+3. **Sign:** Mobile app signs the withdrawal action plans natively via Turnkey and broadcasts.
+4. **Execute:** Mobile calls `POST /api/v1/blend/withdraw/execute`. Backend calls `submit(intentId, { txHashes })`.
 5. **Poll:** Background worker tracks multi-chain settlement.
+
+---
+
+## 6. Endpoints Summary
+
+Based on the decoupled architecture, the backend will expose the following explicit REST endpoints:
+
+*   `POST /api/v1/blend/account/initialize`: Looks up or creates a user's Blend account (Safe).
+*   `POST /api/v1/blend/deposit/prepare`: Creates session, gets quote, locks it to the signer, and returns the unsigned `actionPlan`.
+*   `POST /api/v1/blend/deposit/execute`: Submits the signed `txHashes` to Blend and triggers background polling.
+*   `POST /api/v1/blend/withdraw/prepare`: Counterpart to deposit prepare.
+*   `POST /api/v1/blend/withdraw/execute`: Counterpart to deposit execute.
+*   `GET /api/v1/blend/status/:intentId`: Allows the mobile app to poll for transaction completion.
+*   `GET /api/v1/blend/positions`: Returns user's balances and yields from the Blend Safe.
+*   `GET /api/v1/blend/discovery/yield`: Returns APYs and vault breakdowns.
 
 ---
 
